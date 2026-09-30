@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 
 const LOG = '[Quick GitHub Sync]';
-const VERSION = '1.0.5';
+const VERSION = '1.1.0';
 
 const DEFAULT_SETTINGS = {
     repoUrl: '',
@@ -12,6 +12,9 @@ const DEFAULT_SETTINGS = {
     remote: 'origin',
     userName: '',
     userEmail: '',
+    commitNoteEnabled: true,
+    commitNotePath: '提交记录.md',
+    requireCommitBody: true,
     statusRefreshMinutes: 5,
     gitPath: '',
 };
@@ -33,6 +36,35 @@ const AUTO_GITIGNORE = [
 
 const NET_TIMEOUT_MS = 90000;
 const LOCAL_TIMEOUT_MS = 20000;
+
+// ---- 提交记录文件 ----
+// 用一个 md 文档来写「这次提交了什么」：待填区手写，历史区由插件自动追加。
+const NOTE_PENDING_START = '<!-- QGS:PENDING:START -->';
+const NOTE_PENDING_END = '<!-- QGS:PENDING:END -->';
+const NOTE_HISTORY_HEADING = '## 历史';
+const NOTE_TITLE_KEYS = ['标题', 'Title', 'title'];
+const NOTE_BODY_KEYS = ['说明', '描述', 'Message', 'message', 'Body', 'body'];
+
+const noteTemplate = () =>
+    [
+        '# 提交记录',
+        '',
+        '<!-- 同步之前，把这次的「标题」和「说明」写在下面（冒号后面直接写，同一行即可）。',
+        '     「标题」会成为 commit 标题，「说明」会成为 commit 正文。',
+        '     如果标题还空着就点同步，插件只会提醒你先写好，不会提交任何东西。 -->',
+        '',
+        NOTE_PENDING_START,
+        '标题：',
+        '说明：',
+        NOTE_PENDING_END,
+        '',
+        '---',
+        '',
+        NOTE_HISTORY_HEADING,
+        '',
+        '<!-- 下面是每次同步后自动追加的记录，不用手写 -->',
+        '',
+    ].join('\n');
 
 const pad = (n) => String(n).padStart(2, '0');
 const clock = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -79,6 +111,7 @@ class QuickGitHubSyncPlugin extends Plugin {
         this.statusEl.addEventListener('click', () => {
             // 未配置时点状态栏直接跳到设置页，而不是弹一句「请先配置」然后没下文
             if (!this.isConfigured()) this.openSettings();
+            else if (this.status.state === 'need-note') this.openCommitNote();
             else this.refreshStatus({ announce: true });
         });
         this.renderStatus();
@@ -99,6 +132,11 @@ class QuickGitHubSyncPlugin extends Plugin {
             id: 'open-settings',
             name: '打开设置（仓库地址 / Token）',
             callback: () => this.openSettings(),
+        });
+        this.addCommand({
+            id: 'open-commit-note',
+            name: '打开提交记录（写这次提交了什么）',
+            callback: () => this.openCommitNote(),
         });
 
         this.app.workspace.onLayoutReady(() => {
@@ -338,6 +376,7 @@ class QuickGitHubSyncPlugin extends Plugin {
             }
         }
 
+        await this.ensureNoteMergeDriver(vault);
         await this.ensureIdentity(vault);
         await this.ensureRemote(vault);
     }
@@ -523,6 +562,154 @@ class QuickGitHubSyncPlugin extends Plugin {
         }
     }
 
+    // ---------- 提交记录文件 ----------
+
+    commitNotePath() {
+        const fallback = DEFAULT_SETTINGS.commitNotePath;
+        const raw = (this.settings.commitNotePath || '').trim() || fallback;
+        const clean = raw.replace(/^[./\\]+/, '').replace(/\\/g, '/');
+        if (!clean || clean.split('/').includes('..')) return fallback;
+        return clean;
+    }
+
+    noteAbsPath() {
+        return path.join(this.vaultPath(), this.commitNotePath());
+    }
+
+    // 从文件内容里解析出这次要用的标题 / 说明
+    parseCommitNote(text) {
+        const s = text.indexOf(NOTE_PENDING_START);
+        const e = text.indexOf(NOTE_PENDING_END);
+        const hasMarkers = s !== -1 && e > s;
+        const pending = hasMarkers ? text.slice(s + NOTE_PENDING_START.length, e) : '';
+
+        let title = '';
+        let body = '';
+        let inBody = false;
+
+        for (const raw of pending.split('\n')) {
+            const line = raw.trim();
+            if (!line) {
+                inBody = false;
+                continue;
+            }
+            const tk = NOTE_TITLE_KEYS.find((k) => line.startsWith(k + '：') || line.startsWith(k + ':'));
+            if (tk) {
+                title = line.slice(tk.length + 1).trim();
+                inBody = false;
+                continue;
+            }
+            const bk = NOTE_BODY_KEYS.find((k) => line.startsWith(k + '：') || line.startsWith(k + ':'));
+            if (bk) {
+                body = line.slice(bk.length + 1).trim();
+                inBody = true;
+                continue;
+            }
+            // 说明写了好几行时，后续行也算正文
+            if (inBody) body = body ? body + '\n' + line : line;
+        }
+
+        return { title, body, hasMarkers, pending };
+    }
+
+    // createIfMissing=true 时，文件不存在就按模板建一个（首次同步会用上）
+    readCommitNote(createIfMissing) {
+        const abs = this.noteAbsPath();
+        const empty = { title: '', body: '', hasMarkers: false, pending: '', text: '', ok: false, error: '' };
+
+        try {
+            if (!fs.existsSync(abs)) {
+                if (!createIfMissing) return empty;
+                fs.mkdirSync(path.dirname(abs), { recursive: true });
+                fs.writeFileSync(abs, noteTemplate(), 'utf8');
+                logInfo(`已创建提交记录文件: ${this.commitNotePath()}`);
+            }
+            const text = fs.readFileSync(abs, 'utf8');
+            return Object.assign(this.parseCommitNote(text), { text, ok: true, error: '' });
+        } catch (e) {
+            logError('读取提交记录失败: ' + e.message);
+            return Object.assign(empty, { error: e.message });
+        }
+    }
+
+    // 返回空字符串表示没问题，否则是给用户看的原因
+    validateCommitNote(note) {
+        if (!this.settings.commitNoteEnabled) return '';
+        if (!note || !note.ok) return '读不到提交记录文件' + (note && note.error ? `：${note.error}` : '');
+        if (!note.hasMarkers) {
+            return `「${this.commitNotePath()}」里的待填区标记不见了，请把 ${NOTE_PENDING_START} 和 ${NOTE_PENDING_END} 加回去`;
+        }
+        if (!note.title) return '还没写提交标题';
+        if (this.settings.requireCommitBody && !note.body) return '还没写提交说明';
+        return '';
+    }
+
+    formatNoteEntry(title, body) {
+        let out = `- ${stamp(new Date())} · **${title}**`;
+        if (body) {
+            for (const line of body.split('\n')) out += `\n  ${line}`;
+        }
+        return out + '\n';
+    }
+
+    // 把这次的说明追加到「历史」，同时清空待填区，让这份记录和本次改动一起进同一个 commit
+    writeCommitNote(note, title, body) {
+        const abs = this.noteAbsPath();
+        let text = note.text;
+
+        const s = text.indexOf(NOTE_PENDING_START);
+        const e = text.indexOf(NOTE_PENDING_END);
+        if (s !== -1 && e > s) {
+            const fresh = `\n标题：\n说明：\n`;
+            text = text.slice(0, s + NOTE_PENDING_START.length) + fresh + text.slice(e);
+        } else {
+            logWarn('找不到待填区标记，这次不清空标题/说明（避免误删内容）');
+        }
+
+        text = text.replace(/\s*$/, '\n\n') + this.formatNoteEntry(title, body);
+        fs.writeFileSync(abs, text, 'utf8');
+        return text;
+    }
+
+    async openCommitNote() {
+        const rel = this.commitNotePath();
+        this.readCommitNote(true); // 保证文件存在，否则打不开
+        try {
+            const file = this.app.vault.getAbstractFileByPath(rel);
+            if (file) {
+                await this.app.workspace.getLeaf(true).openFile(file);
+                return true;
+            }
+        } catch (e) {
+            logWarn('打开提交记录失败: ' + e.message);
+        }
+        try {
+            this.app.workspace.openLinkText(rel, '', false);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // 两台电脑都往同一个日志文件追加时，默认合并会冲突。
+    // union 是 git 内置合并驱动，标记一下就能让「两边各加一行」自动合并成功。
+    ensureNoteMergeDriver(vault) {
+        if (!this.settings.commitNoteEnabled) return;
+        try {
+            const rel = this.commitNotePath();
+            const line = `${rel.replace(/ /g, '\\ ')} merge=union`;
+            const file = path.join(vault, '.gitattributes');
+            const text = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
+
+            if (text.split('\n').some((l) => l.trim() === line)) return;
+
+            fs.writeFileSync(file, text.replace(/\s*$/, '\n\n').replace(/^\n+/, '') + line + '\n', 'utf8');
+            logInfo(`已在 .gitattributes 标记「${rel}」用 union 合并，两台电脑同时记录也不会冲突`);
+        } catch (e) {
+            logWarn('写入 .gitattributes 失败: ' + e.message);
+        }
+    }
+
     // ---------- 状态 ----------
 
     setStatus(patch) {
@@ -555,6 +742,11 @@ class QuickGitHubSyncPlugin extends Plugin {
         } else if (s.state === 'error') {
             text = 'GitHub 出错';
             tip = s.message || '';
+        } else if (s.state === 'need-note') {
+            text = 'GitHub 待写提交说明';
+            tip =
+                `${s.message || '还没写提交标题'}。\n\n` +
+                `请打开「${this.commitNotePath()}」写好标题和说明，\n再点一次同步（这次一个字节都没提交）。`;
         } else {
             const bits = [];
             if (s.behind > 0) bits.push(`↓${s.behind}`);
@@ -571,6 +763,15 @@ class QuickGitHubSyncPlugin extends Plugin {
                 lines.push(`本地待推送: ${s.ahead}`);
             }
             lines.push(`未提交改动: ${s.dirty}`);
+
+            // 有改动时把待提交的说明也显示出来，点同步前心里有数
+            if (s.dirty > 0 && this.settings.commitNoteEnabled) {
+                const note = this.readCommitNote(false);
+                if (note.ok) {
+                    lines.push(`本次提交说明: ${note.title ? note.title : '（还没写）'}`);
+                }
+            }
+
             lines.push(`上次同步: ${s.lastSync ? stamp(s.lastSync) : '本次会话还没有'}`);
             if (s.checkedAt) lines.push(`状态检查: ${clock(s.checkedAt)}`);
             lines.push('');
@@ -673,11 +874,42 @@ class QuickGitHubSyncPlugin extends Plugin {
         try {
             await this.ensureRepo(vault);
 
-            // 1) 先把本地改动落成一个提交，避免后面拉取时丢东西
+            // 1) 有改动才需要提交说明；只是拉取远端（本地没动过）不该拦着用户
             await this.run(['-C', vault, 'add', '-A']);
-            const dirty = await this.dirtyCount(vault);
+            let dirty = await this.dirtyCount(vault);
+
             if (dirty > 0) {
-                await this.run(['-C', vault, 'commit', '-m', `Obsidian Auto Sync ${stamp(new Date())}`]);
+                let messageArgs;
+
+                if (this.settings.commitNoteEnabled) {
+                    const note = this.readCommitNote(true);
+                    const problem = this.validateCommitNote(note);
+
+                    if (problem) {
+                        // 说清楚缺什么，直接把人送到那个文件，一个字节都不提交
+                        logWarn('缺少提交说明，已中止: ' + problem);
+                        this.setStatus({ state: 'need-note', message: problem, checkedAt: new Date() });
+                        new Notice(
+                            `Quick GitHub Sync: ${problem}。\n` +
+                                `请在「${this.commitNotePath()}」里写好标题和说明，再点一次同步。`,
+                            12000
+                        );
+                        await this.openCommitNote();
+                        return;
+                    }
+
+                    this.writeCommitNote(note, note.title, note.body);
+                    logInfo('提交说明: ' + note.title);
+                    messageArgs = ['-m', note.title];
+                    if (note.body) messageArgs.push('-m', note.body);
+                } else {
+                    messageArgs = ['-m', `Obsidian Auto Sync ${stamp(new Date())}`];
+                }
+
+                // 记录文件的更新要重新 add，这样它和本次改动进同一个 commit
+                await this.run(['-C', vault, 'add', '-A']);
+                dirty = await this.dirtyCount(vault);
+                await this.run(['-C', vault, 'commit'].concat(messageArgs));
                 logInfo(`已提交本地 ${dirty} 项改动`);
             } else {
                 logInfo('本地没有需要提交的改动');
@@ -911,6 +1143,90 @@ class QuickGitHubSyncSettingTab extends PluginSettingTab {
             })
             .catch(() => {});
 
+        // ---- 提交说明 ----
+        containerEl.createEl('h3', { text: '提交说明（每次提交前写）' });
+        containerEl.createEl('p', {
+            text:
+                `同步时会把「${p.commitNotePath()}」里写好的内容当作 commit 的标题和正文，` +
+                '并把「时间 + 标题 + 说明」追加到该文件的「历史」里。' +
+                '有改动但还没写标题时，同步会被拦下来提醒你先写，不会提交。' +
+                '（只是拉取远端、本地没动过时不会被拦。）',
+            cls: 'setting-item-description',
+        });
+
+        const notePreview = containerEl.createEl('div', { cls: 'quick-github-sync-status-box' });
+        const refreshNotePreview = () => {
+            const path = p.commitNotePath();
+            if (!p.settings.commitNoteEnabled) {
+                notePreview.setText('提交说明：已关闭，将使用自动生成的提交信息。');
+                return;
+            }
+            const note = p.readCommitNote(false);
+            if (!note.ok) {
+                notePreview.setText(`提交说明：还没写（首次同步会自动创建「${path}」）`);
+                return;
+            }
+            if (!note.hasMarkers) {
+                notePreview.setText(`提交说明：「${path}」的待填区标记不见了，同步会被拦下`);
+                return;
+            }
+            notePreview.setText(
+                `提交说明：标题「${note.title || '（空）'}」 · 说明「${note.body || '（空）'}」\n` +
+                    `文件：${path}`
+            );
+        };
+        refreshNotePreview();
+
+        new Setting(containerEl)
+            .setName('启用提交说明文件')
+            .setDesc('关闭后回到原来的行为：用「Obsidian Auto Sync 时间」当提交信息')
+            .addToggle((t) =>
+                t.setValue(!!p.settings.commitNoteEnabled).onChange(async (v) => {
+                    p.settings.commitNoteEnabled = v;
+                    await p.saveSettings();
+                    if (v) p.ensureNoteMergeDriver(p.vaultPath());
+                    refreshNotePreview();
+                    refreshHint();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('提交记录文件路径')
+            .setDesc('相对 vault 根目录的路径，默认 提交记录.md。改完会自动把新路径加进 .gitattributes')
+            .addText((t) =>
+                t
+                    .setPlaceholder('提交记录.md')
+                    .setValue(p.settings.commitNotePath)
+                    .onChange(async (v) => {
+                        p.settings.commitNotePath = v.trim();
+                        await p.saveSettings();
+                        p.ensureNoteMergeDriver(p.vaultPath());
+                        refreshNotePreview();
+                    })
+            );
+
+        new Setting(containerEl)
+            .setName('必须填写说明')
+            .setDesc('打开时标题和说明都不能为空；关闭时只强制要求标题')
+            .addToggle((t) =>
+                t.setValue(!!p.settings.requireCommitBody).onChange(async (v) => {
+                    p.settings.requireCommitBody = v;
+                    await p.saveSettings();
+                })
+            );
+
+        new Setting(containerEl)
+            .setName('提交记录')
+            .setDesc('打开那个 md 文档写这次的标题和说明')
+            .addButton((b) =>
+                b.setButtonText('打开提交记录').onClick(async () => {
+                    await p.openCommitNote();
+                })
+            )
+            .addButton((b) =>
+                b.setButtonText('刷新').onClick(() => refreshNotePreview())
+            );
+
         new Setting(containerEl)
             .setName('Personal Access Token')
             .setDesc(
@@ -1032,6 +1348,7 @@ class QuickGitHubSyncSettingTab extends PluginSettingTab {
                     .onClick(async () => {
                         await p.sync();
                         refreshStatusBox();
+                        refreshNotePreview();
                         refreshHint();
                     })
             );
