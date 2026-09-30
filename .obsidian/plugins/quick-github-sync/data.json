@@ -1,3 +1,9 @@
 {
-  "repoUrl": "https://github.com/WangSnowchen/CG_Human_NoteBook.git"
+  "repoUrl": "https://github.com/WangSnowchen/CG_Human_NoteBook.git",
+  "branch": "main",
+  "remote": "origin",
+  "userName": "XueWen",
+  "userEmail": "wang1017643209@163.com",
+  "statusRefreshMinutes": 5,
+  "gitPath": ""
 }

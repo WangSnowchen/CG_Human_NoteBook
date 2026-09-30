@@ -4,11 +4,14 @@ const path = require('path');
 const fs = require('fs');
 
 const LOG = '[Quick GitHub Sync]';
+const VERSION = '1.0.5';
 
 const DEFAULT_SETTINGS = {
     repoUrl: '',
     branch: 'main',
     remote: 'origin',
+    userName: '',
+    userEmail: '',
     statusRefreshMinutes: 5,
     gitPath: '',
 };
@@ -23,6 +26,7 @@ const AUTO_GITIGNORE = [
     '# Quick GitHub Sync 自动生成',
     '.obsidian/workspace.json',
     '.obsidian/workspace-mobile.json',
+    '.DS_Store',
     '.trash/',
     '',
 ].join('\n');
@@ -42,8 +46,11 @@ const logError = (...a) => console.error(LOG, ...a);
 
 class QuickGitHubSyncPlugin extends Plugin {
     busy = false;
+    testing = false;
     statusEl = null;
     timer = null;
+    settingTab = null;
+    identityProbe = null;
 
     status = {
         state: 'unconfigured',
@@ -57,13 +64,23 @@ class QuickGitHubSyncPlugin extends Plugin {
 
     async onload() {
         await this.loadSettings();
-        logInfo('本地增强版 1.0.3 已加载');
+        logInfo(`本地增强版 ${VERSION} 已加载`);
         logInfo('仓库:', this.settings.repoUrl || '(未配置)');
+        logInfo('Token:', this.getToken() ? '已保存' : '(未配置)');
         logInfo('分支:', this.branch(), '| remote:', this.remote());
+
+        // 关键：把设置页注册进去，否则「设置 → 第三方插件」里根本找不到本插件，
+        // 仓库地址和 Token 就没有任何地方可以填写。
+        this.settingTab = new QuickGitHubSyncSettingTab(this.app, this);
+        this.addSettingTab(this.settingTab);
 
         this.statusEl = this.addStatusBarItem();
         this.statusEl.addClass('quick-github-sync-status');
-        this.statusEl.addEventListener('click', () => this.refreshStatus({ announce: true }));
+        this.statusEl.addEventListener('click', () => {
+            // 未配置时点状态栏直接跳到设置页，而不是弹一句「请先配置」然后没下文
+            if (!this.isConfigured()) this.openSettings();
+            else this.refreshStatus({ announce: true });
+        });
         this.renderStatus();
 
         this.addRibbonIcon('cloud-upload', 'Sync vault with GitHub', () => this.sync());
@@ -77,6 +94,11 @@ class QuickGitHubSyncPlugin extends Plugin {
             id: 'check-remote-status',
             name: '检查远端仓库状态',
             callback: () => this.refreshStatus({ announce: true }),
+        });
+        this.addCommand({
+            id: 'open-settings',
+            name: '打开设置（仓库地址 / Token）',
+            callback: () => this.openSettings(),
         });
 
         this.app.workspace.onLayoutReady(() => {
@@ -102,12 +124,68 @@ class QuickGitHubSyncPlugin extends Plugin {
         this.renderStatus();
     }
 
+    isConfigured() {
+        return !!((this.settings.repoUrl || '').trim() && this.getToken());
+    }
+
+    // Token 存在本机（localStorage）而不是 data.json，因为 .obsidian/plugins/**/data.json
+    // 会跟着仓库一起提交，写进去等于把 PAT 公开到 GitHub 上。
+    // Obsidian 1.13 起 app.loadLocalStorage 已废弃，所以两条路都试一遍。
     getToken() {
-        return this.app.loadLocalStorage(TOKEN_KEY) ?? '';
+        try {
+            if (this.app && typeof this.app.loadLocalStorage === 'function') {
+                const v = this.app.loadLocalStorage(TOKEN_KEY);
+                if (v) return String(v).trim();
+            }
+        } catch (e) {
+            logWarn('loadLocalStorage 不可用，改用 window.localStorage: ' + e.message);
+        }
+        try {
+            const v = window.localStorage.getItem(TOKEN_KEY);
+            if (v) return String(v).trim();
+        } catch (e) {
+            logError('读取 localStorage 失败: ' + e.message);
+        }
+        return '';
     }
 
     setToken(value) {
-        this.app.saveLocalStorage(TOKEN_KEY, value);
+        const v = String(value == null ? '' : value).trim();
+        let saved = false;
+
+        try {
+            if (this.app && typeof this.app.saveLocalStorage === 'function') {
+                this.app.saveLocalStorage(TOKEN_KEY, v);
+                saved = true;
+            }
+        } catch (e) {
+            logWarn('saveLocalStorage 不可用，改用 window.localStorage: ' + e.message);
+        }
+
+        try {
+            window.localStorage.setItem(TOKEN_KEY, v);
+            saved = true;
+        } catch (e) {
+            logError('写入 localStorage 失败: ' + e.message);
+        }
+
+        if (!saved) new Notice('Quick GitHub Sync: Token 保存失败，请看控制台日志');
+        this.renderStatus();
+    }
+
+    // 直接跳到本插件的设置页，省得用户自己在一堆插件里翻
+    openSettings() {
+        const setting = this.app && this.app.setting;
+        if (setting && typeof setting.openTabById === 'function') {
+            try {
+                setting.openTabById(this.manifest.id);
+                return true;
+            } catch (e) {
+                logWarn('openTabById 失败: ' + e.message);
+            }
+        }
+        new Notice('Quick GitHub Sync: 请打开 设置 → 第三方插件 → Quick GitHub Sync');
+        return false;
     }
 
     branch() {
@@ -264,25 +342,80 @@ class QuickGitHubSyncPlugin extends Plugin {
         await this.ensureRemote(vault);
     }
 
-    async ensureIdentity(vault) {
+    // 读某个 git 身份字段的「当前生效值」（仓库级 → 全局 → 系统，git 自己会挑）
+    async gitIdentityValue(vault, key) {
+        try {
+            const out = await this.run(['-C', vault, 'config', '--get', key], { quiet: true });
+            return (out || '').trim();
+        } catch (_) {
+            return '';
+        }
+    }
+
+    // 返回 { name, email }：当前实际会用于 commit 的身份，供设置页做占位提示
+    async currentIdentity() {
+        const vault = this.vaultPath();
+        const id = {
+            name: await this.gitIdentityValue(vault, 'user.name'),
+            email: await this.gitIdentityValue(vault, 'user.email'),
+        };
+        this.identityProbe = id;
+        return id;
+    }
+
+    // 把设置页里填的名字/邮箱写进仓库级 git config，返回仍然缺失的字段
+    async applyIdentity(vault) {
+        const wanted = [
+            ['user.name', (this.settings.userName || '').trim()],
+            ['user.email', (this.settings.userEmail || '').trim()],
+        ];
         const missing = [];
-        for (const key of ['user.name', 'user.email']) {
-            let val = '';
-            try {
-                val = await this.run(['-C', vault, 'config', '--get', key], { quiet: true });
-            } catch (_) {
-                val = '';
+
+        for (const [key, want] of wanted) {
+            let current = await this.gitIdentityValue(vault, key);
+
+            if (want && current !== want) {
+                try {
+                    await this.run(['-C', vault, 'config', key, want]);
+                    logInfo(`已写入仓库级 ${key} = ${want}`);
+                    current = want;
+                } catch (e) {
+                    logWarn(`写入 ${key} 失败: ` + e.message);
+                }
             }
-            if (!val.trim()) missing.push(key);
+            if (!current) missing.push(key);
         }
-        if (missing.length) {
-            throw new Error(
-                `git 还没配置 ${missing.join(' / ')}，无法提交。\n\n` +
-                    '请先在终端执行：\n' +
-                    '  git config --global user.name "你的名字"\n' +
-                    '  git config --global user.email "你的邮箱"'
-            );
+        return missing;
+    }
+
+    // 设置页里改完名字/邮箱就直接落盘到仓库级 git config，不必等到点同步
+    async pushIdentityToGit() {
+        try {
+            const missing = await this.applyIdentity(this.vaultPath());
+            await this.currentIdentity();
+            return missing;
+        } catch (e) {
+            logWarn('写入提交者身份失败: ' + e.message);
+            return null;
         }
+    }
+
+    async ensureIdentity(vault) {
+        const missing = await this.applyIdentity(vault);
+        if (!missing.length) return;
+
+        const label = {
+            'user.name': '提交者名字（user.name）',
+            'user.email': '提交者邮箱（user.email）',
+        };
+        throw new Error(
+            `还缺 ${missing.map((k) => label[k] || k).join(' / ')}，git 不知道该以谁的名义提交。\n\n` +
+                '推荐：在 设置 → 第三方插件 → Quick GitHub Sync 里填写「提交者名字」和「提交者邮箱」，' +
+                '插件会自动写进本仓库的 git 配置。\n\n' +
+                '或者在终端里配一次全局身份：\n' +
+                '  git config --global user.name "你的名字"\n' +
+                '  git config --global user.email "你的邮箱"'
+        );
     }
 
     async ensureRemote(vault) {
@@ -351,6 +484,45 @@ class QuickGitHubSyncPlugin extends Plugin {
         };
     }
 
+    // 不依赖本地仓库，直接问远端：用来单独验证「仓库地址 + Token」是否可用
+    async testConnection() {
+        const url = (this.settings.repoUrl || '').trim();
+        if (!url) {
+            new Notice('Quick GitHub Sync: 请先填写仓库地址');
+            return false;
+        }
+        if (!this.getToken()) {
+            new Notice('Quick GitHub Sync: 请先填写 Personal Access Token');
+            return false;
+        }
+        if (this.testing) return false;
+
+        this.testing = true;
+        new Notice('Quick GitHub Sync: 正在测试连接…');
+        try {
+            const out = await this.run(['ls-remote', '--heads', url, this.branch()], {
+                auth: true,
+                timeout: NET_TIMEOUT_MS,
+            });
+            if (out.split('\n').some((l) => l.trim())) {
+                logInfo('连接测试成功');
+                new Notice('Quick GitHub Sync: 连接成功，仓库和 Token 都可用 ✓');
+                return true;
+            }
+            logInfo('连接测试成功，但远端还没有该分支');
+            new Notice(
+                `Quick GitHub Sync: 能连上，但远端还没有 ${this.branch()} 分支（首次同步会自动创建）`
+            );
+            return true;
+        } catch (e) {
+            logError('连接测试失败: ' + e.message);
+            new Notice('Quick GitHub Sync: 连接失败\n' + e.message, 12000);
+            return false;
+        } finally {
+            this.testing = false;
+        }
+    }
+
     // ---------- 状态 ----------
 
     setStatus(patch) {
@@ -367,7 +539,10 @@ class QuickGitHubSyncPlugin extends Plugin {
 
         if (s.state === 'unconfigured') {
             text = 'GitHub 未配置';
-            tip = '还没填仓库地址或 Token。\n设置 → 第三方插件 → Quick GitHub Sync';
+            const missing = [];
+            if (!(this.settings.repoUrl || '').trim()) missing.push('仓库地址');
+            if (!this.getToken()) missing.push('Token');
+            tip = `还缺：${missing.join('、')}。\n\n点击这里直接打开设置页填写。`;
         } else if (s.state === 'no-repo') {
             text = 'GitHub 未初始化';
             tip = '这个 vault 还不是 git 仓库。\n点同步按钮会自动 git init。';
@@ -412,9 +587,12 @@ class QuickGitHubSyncPlugin extends Plugin {
         opts = opts || {};
         if (this.busy) return;
 
-        if (!this.settings.repoUrl || !this.getToken()) {
+        if (!this.isConfigured()) {
             this.setStatus({ state: 'unconfigured' });
-            if (opts.announce) new Notice('Quick GitHub Sync: 请先填写仓库地址和 Token');
+            if (opts.announce) {
+                new Notice('Quick GitHub Sync: 请先填写仓库地址和 Token');
+                this.openSettings();
+            }
             return;
         }
 
@@ -476,9 +654,10 @@ class QuickGitHubSyncPlugin extends Plugin {
             new Notice('Quick GitHub Sync: 正在同步中，请稍候');
             return;
         }
-        if (!this.settings.repoUrl || !this.getToken()) {
+        if (!this.isConfigured()) {
             this.setStatus({ state: 'unconfigured' });
-            new Notice('Quick GitHub Sync: 请先在插件设置里填写仓库地址和 Token');
+            new Notice('Quick GitHub Sync: 请先填写仓库地址和 Token，正在打开设置页…');
+            this.openSettings();
             return;
         }
 
@@ -571,6 +750,8 @@ class QuickGitHubSyncPlugin extends Plugin {
             logError('同步失败: ' + e.message);
             this.setStatus({ state: 'error', message: e.message, checkedAt: new Date() });
             new Notice('Quick GitHub Sync: 同步失败\n' + e.message, 12000);
+            // 缺提交者身份 / 缺仓库地址这类问题，直接把人送到能改的地方
+            if (/user\.name|user\.email|提交者|仓库地址|Token/.test(e.message)) this.openSettings();
         } finally {
             this.busy = false;
             this.renderStatus();
@@ -588,8 +769,54 @@ class QuickGitHubSyncSettingTab extends PluginSettingTab {
         const { containerEl } = this;
         const p = this.plugin;
         containerEl.empty();
+        containerEl.addClass('quick-github-sync-settings');
 
-        containerEl.createEl('h2', { text: 'Quick GitHub Sync（本地增强版 1.0.3）' });
+        containerEl.createEl('h2', { text: `Quick GitHub Sync（本地增强版 ${VERSION}）` });
+
+        // ---- 缺什么就明说什么，别让用户自己猜 ----
+        const hintBox = containerEl.createEl('div', { cls: 'qgs-hint' });
+        const refreshHint = () => {
+            hintBox.empty();
+            const missing = [];
+            if (!(p.settings.repoUrl || '').trim()) missing.push('仓库地址');
+            if (!p.getToken()) missing.push('Personal Access Token');
+
+            const name = (p.settings.userName || '').trim();
+            const email = (p.settings.userEmail || '').trim();
+            const probe = p.identityProbe;
+
+            let idLine;
+            if (name && email) idLine = `提交者身份：用你填写的 ${name} <${email}>`;
+            else if (probe && probe.name && probe.email)
+                idLine = `提交者身份：沿用 git 已有配置（${probe.name} <${probe.email}>）`;
+            else if (probe) idLine = '⚠ 提交者身份还没配，同步时 git 会拒绝提交 —— 请在下面的「提交者身份」里填写';
+            else idLine = '提交者身份：读取中…';
+
+            if (!missing.length) {
+                hintBox.removeClass('qgs-hint-warn');
+                hintBox.addClass('qgs-hint-ok');
+                hintBox.createEl('strong', { text: '✓ 仓库地址和 Token 都齐了。' });
+                hintBox.createEl('div', { text: idLine });
+                return;
+            }
+
+            hintBox.removeClass('qgs-hint-ok');
+            hintBox.addClass('qgs-hint-warn');
+            hintBox.createEl('strong', { text: '还缺：' + missing.join('、') });
+            hintBox.createEl('div', {
+                text: '1) 仓库地址填 HTTPS 形式，例如 https://github.com/用户名/仓库.git',
+            });
+            hintBox.createEl('div', {
+                text:
+                    '2) 到 GitHub → Settings → Developer settings → Personal access tokens 生成 Token' +
+                    '（经典 Token 勾 repo；细粒度 Token 给 Contents: Read and write），粘贴到下面的 Token 输入框',
+            });
+            hintBox.createEl('div', {
+                text: '3) Token 只存在本机 Obsidian 里，不会写进 vault，因此不会被提交到 GitHub',
+            });
+            hintBox.createEl('div', { text: idLine });
+        };
+        refreshHint();
 
         const statusBox = containerEl.createEl('div', { cls: 'quick-github-sync-status-box' });
         const refreshStatusBox = () => {
@@ -607,9 +834,11 @@ class QuickGitHubSyncSettingTab extends PluginSettingTab {
         };
         refreshStatusBox();
 
+        let tokenInput = null;
+
         new Setting(containerEl)
             .setName('仓库地址')
-            .setDesc('HTTPS 地址，例如 https://github.com/用户名/仓库.git')
+            .setDesc('要同步到的 GitHub 仓库，HTTPS 形式，填完会自动设置 git remote')
             .addText((t) =>
                 t
                     .setPlaceholder('https://github.com/username/repo.git')
@@ -617,6 +846,114 @@ class QuickGitHubSyncSettingTab extends PluginSettingTab {
                     .onChange(async (v) => {
                         p.settings.repoUrl = v.trim();
                         await p.saveSettings();
+                        refreshHint();
+                    })
+            );
+
+        // ---- 提交者身份：决定 commit 的 author ----
+        containerEl.createEl('h3', { text: '提交者身份（commit 的 author）' });
+        containerEl.createEl('p', {
+            text:
+                '填一次就行，插件会自动写进本仓库的 git 配置（user.name / user.email）。' +
+                '留空则沿用你电脑上已有的 git 全局配置；两边都没有时，同步会失败并提示。',
+            cls: 'setting-item-description',
+        });
+
+        let nameInput = null;
+        let emailInput = null;
+
+        new Setting(containerEl)
+            .setName('提交者名字')
+            .setDesc('每次自动提交的作者名，例如 WangSnowchen')
+            .addText((t) => {
+                nameInput = t;
+                t.setPlaceholder('你的名字')
+                    .setValue(p.settings.userName)
+                    .onChange(async (v) => {
+                        p.settings.userName = v.trim();
+                        await p.saveSettings();
+                        refreshHint();
+                    });
+                t.inputEl.addEventListener('blur', async () => {
+                    await p.pushIdentityToGit();
+                    refreshHint();
+                });
+            });
+
+        new Setting(containerEl)
+            .setName('提交者邮箱')
+            .setDesc('建议填 GitHub 账号绑定的邮箱，这样提交才会归属到你的账号')
+            .addText((t) => {
+                emailInput = t;
+                t.setPlaceholder('you@example.com')
+                    .setValue(p.settings.userEmail)
+                    .onChange(async (v) => {
+                        p.settings.userEmail = v.trim();
+                        await p.saveSettings();
+                        refreshHint();
+                    });
+                t.inputEl.addEventListener('blur', async () => {
+                    await p.pushIdentityToGit();
+                    refreshHint();
+                });
+            });
+
+        // 异步读一下 git 现在实际生效的身份，放进占位符里当参考
+        p.currentIdentity()
+            .then(() => {
+                if (nameInput && !nameInput.inputEl.value && p.identityProbe && p.identityProbe.name) {
+                    nameInput.setPlaceholder(`当前 git 配置：${p.identityProbe.name}`);
+                }
+                if (emailInput && !emailInput.inputEl.value && p.identityProbe && p.identityProbe.email) {
+                    emailInput.setPlaceholder(`当前 git 配置：${p.identityProbe.email}`);
+                }
+                refreshHint();
+            })
+            .catch(() => {});
+
+        new Setting(containerEl)
+            .setName('Personal Access Token')
+            .setDesc(
+                '需要 repo（或 Contents: Read and write）权限的 GitHub PAT。' +
+                    '只保存在本机 Obsidian 的 localStorage 里，不会写进 vault，也不会被提交到仓库。'
+            )
+            .addText((t) => {
+                tokenInput = t.inputEl;
+                t.inputEl.type = 'password';
+                t.inputEl.autocomplete = 'off';
+                t.inputEl.spellcheck = false;
+                t.setPlaceholder('ghp_... 或 github_pat_...')
+                    .setValue(p.getToken())
+                    .onChange((v) => {
+                        p.setToken(v);
+                        refreshHint();
+                    });
+                t.inputEl.addEventListener('blur', () => {
+                    const v = t.inputEl.value.trim();
+                    if (v !== p.getToken()) p.setToken(v);
+                    refreshHint();
+                });
+            })
+            .addExtraButton((b) =>
+                b
+                    .setIcon('eye')
+                    .setTooltip('显示 / 隐藏 Token')
+                    .onClick(() => {
+                        if (!tokenInput) return;
+                        const show = tokenInput.type === 'password';
+                        tokenInput.type = show ? 'text' : 'password';
+                        b.setIcon(show ? 'eye-off' : 'eye');
+                    })
+            )
+            .addExtraButton((b) =>
+                b
+                    .setIcon('trash')
+                    .setTooltip('清除本机保存的 Token')
+                    .onClick(() => {
+                        p.setToken('');
+                        if (tokenInput) tokenInput.value = '';
+                        refreshHint();
+                        new Notice('Quick GitHub Sync: 已清除本机保存的 Token');
                     })
             );
 
@@ -630,21 +967,22 @@ class QuickGitHubSyncSettingTab extends PluginSettingTab {
                     .onChange(async (v) => {
                         p.settings.branch = v.trim();
                         await p.saveSettings();
+                        refreshStatusBox();
                     })
             );
 
         new Setting(containerEl)
-            .setName('Personal Access Token')
-            .setDesc(
-                '需要 repo 权限的 GitHub PAT。只存在本机 Obsidian 的 localStorage 里，' +
-                    '不会写进 vault，因此不会被提交到仓库。'
-            )
-            .addText((t) => {
-                t.inputEl.type = 'password';
-                t.setPlaceholder('ghp_...')
-                    .setValue(p.getToken())
-                    .onChange((v) => p.setToken(v.trim()));
-            });
+            .setName('remote 名称')
+            .setDesc('默认 origin，一般不用改')
+            .addText((t) =>
+                t
+                    .setPlaceholder('origin')
+                    .setValue(p.settings.remote)
+                    .onChange(async (v) => {
+                        p.settings.remote = v.trim();
+                        await p.saveSettings();
+                    })
+            );
 
         new Setting(containerEl)
             .setName('自动检查远端状态')
@@ -673,27 +1011,35 @@ class QuickGitHubSyncSettingTab extends PluginSettingTab {
             );
 
         new Setting(containerEl)
-            .setName('立即同步')
-            .setDesc('拉取远端最新 → 提交本地改动 → 推送。忘了同步也能一次追上。')
+            .setName('操作')
+            .setDesc('建议先「测试连接」确认仓库地址和 Token 都对，再点「同步」。')
             .addButton((b) =>
-                b
-                    .setButtonText('同步')
-                    .setCta()
-                    .onClick(async () => {
-                        await p.sync();
-                        refreshStatusBox();
-                    })
+                b.setButtonText('测试连接').onClick(async () => {
+                    await p.testConnection();
+                    refreshStatusBox();
+                })
             )
             .addButton((b) =>
                 b.setButtonText('检查状态').onClick(async () => {
                     await p.refreshStatus({ announce: true });
                     refreshStatusBox();
                 })
+            )
+            .addButton((b) =>
+                b
+                    .setButtonText('立即同步')
+                    .setCta()
+                    .onClick(async () => {
+                        await p.sync();
+                        refreshStatusBox();
+                        refreshHint();
+                    })
             );
 
         containerEl.createEl('p', {
             text:
-                '提示：详细日志在开发者控制台（Ctrl+Shift+I → Console），前缀 [Quick GitHub Sync]。',
+                '同步逻辑：先提交本地改动 → 拉取远端（rebase）→ 推送。' +
+                '详细日志在开发者控制台（Ctrl+Shift+I → Console），前缀 [Quick GitHub Sync]。',
             cls: 'setting-item-description',
         });
     }

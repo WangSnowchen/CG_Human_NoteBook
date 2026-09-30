@@ -1,3 +1,7 @@
 # Obsidian 的窗口布局，每次开关窗口/切标签都会变，没必要进版本库
 .obsidian/workspace.json
 .obsidian/workspace-mobile.json
+
+# macOS 自己生成的垃圾文件（插件用 git add -A，不忽略就会被提交进来）
+.DS_Store
+

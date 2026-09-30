@@ -1,0 +1,39 @@
+/* Quick GitHub Sync —— 设置页样式 */
+
+.quick-github-sync-settings .qgs-hint {
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 18px;
+    font-size: var(--font-ui-small);
+    line-height: 1.6;
+}
+
+.quick-github-sync-settings .qgs-hint strong {
+    display: block;
+    margin-bottom: 4px;
+}
+
+.quick-github-sync-settings .qgs-hint-warn {
+    border: 1px solid var(--color-orange, #d9822b);
+    background-color: rgba(217, 130, 43, 0.1);
+}
+
+.quick-github-sync-settings .qgs-hint-ok {
+    border: 1px solid var(--color-green, #08b94e);
+    background-color: rgba(8, 185, 78, 0.1);
+}
+
+.quick-github-sync-settings .quick-github-sync-status-box {
+    white-space: pre-wrap;
+    font-family: var(--font-monospace);
+    font-size: var(--font-ui-smaller);
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    margin-bottom: 22px;
+    color: var(--text-muted);
+}
+
+.quick-github-sync-settings .setting-item-description {
+    line-height: 1.6;
+}
