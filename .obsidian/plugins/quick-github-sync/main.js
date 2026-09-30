@@ -4,7 +4,7 @@ const path = require('path');
 const fs = require('fs');
 
 const LOG = '[Quick GitHub Sync]';
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 
 const DEFAULT_SETTINGS = {
     repoUrl: '',
@@ -139,10 +139,31 @@ class QuickGitHubSyncPlugin extends Plugin {
             callback: () => this.openCommitNote(),
         });
 
+        this.announceVersion();
+
         this.app.workspace.onLayoutReady(() => {
             this.refreshStatus();
             this.restartTimer();
         });
+    }
+
+    // 改完 main.js 必须重载插件才会生效；重载成功时弹一次提示，
+    // 免得出现「改了代码但跑的还是旧版本」这种看不出所以然的问题。
+    announceVersion() {
+        const KEY = 'quick-github-sync:last-version';
+        let last = '';
+        try {
+            last = window.localStorage.getItem(KEY) || '';
+        } catch (_) {
+            /* 忽略 */
+        }
+        if (last === VERSION) return;
+        try {
+            window.localStorage.setItem(KEY, VERSION);
+        } catch (_) {
+            /* 忽略 */
+        }
+        new Notice(`Quick GitHub Sync 已加载 ${VERSION}`, 5000);
     }
 
     onunload() {
@@ -779,6 +800,8 @@ class QuickGitHubSyncPlugin extends Plugin {
             tip = lines.join('\n');
         }
 
+        // 鼠标悬停能看到当前实际运行的版本，方便确认插件到底重载没有
+        tip = (tip ? tip + '\n\n' : '') + `运行版本：${VERSION}`;
         this.statusEl.setText(text);
         this.statusEl.setAttribute('aria-label', tip);
         this.statusEl.title = tip;
