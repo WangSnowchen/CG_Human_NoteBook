@@ -1,0 +1,3 @@
+# Obsidian 的窗口布局，每次开关窗口/切标签都会变，没必要进版本库
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
