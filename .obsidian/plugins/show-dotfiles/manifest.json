@@ -1,0 +1,9 @@
+{
+  "id": "show-dotfiles",
+  "name": "显示隐藏文件",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "让 . 开头的隐藏文件和文件夹出现在 Obsidian 原生文件浏览器里（例如 .gitkeep、.obsidian/、.git/）。",
+  "author": "WangSnowchen",
+  "isDesktopOnly": true
+}

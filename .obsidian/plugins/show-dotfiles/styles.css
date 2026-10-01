@@ -1,0 +1,38 @@
+/* 显示隐藏文件（Show Dotfiles）—— 设置页样式 */
+
+.show-dotfiles-settings .sdf-hint {
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 18px;
+    font-size: var(--font-ui-small);
+    line-height: 1.7;
+}
+
+.show-dotfiles-settings .sdf-hint strong {
+    display: block;
+    margin-bottom: 4px;
+}
+
+.show-dotfiles-settings .sdf-hint code {
+    font-size: 0.95em;
+}
+
+/* 橙色：讲清楚代价与风险 */
+.show-dotfiles-settings .sdf-hint-warn {
+    border: 1px solid var(--color-orange, #d9822b);
+    background-color: rgba(217, 130, 43, 0.1);
+}
+
+/* 蓝色：普通说明 */
+.show-dotfiles-settings .sdf-hint-info {
+    border: 1px solid var(--color-blue, #086ddd);
+    background-color: rgba(8, 109, 221, 0.1);
+}
+
+/* 统计行 */
+.show-dotfiles-settings .sdf-stats {
+    font-family: var(--font-monospace);
+    font-size: var(--font-ui-small);
+    color: var(--text-muted);
+    margin-top: 6px;
+}
