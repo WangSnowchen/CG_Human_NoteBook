@@ -1,10 +1,10 @@
-const { Plugin, Notice, PluginSettingTab, Setting } = require('obsidian');
+const { Plugin, Notice, PluginSettingTab, Setting, ItemView, Menu, Modal } = require('obsidian');
 const { execFile } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
 const LOG = '[Quick GitHub Sync]';
-const VERSION = '1.1.1';
+const VERSION = '1.2.0';
 
 const DEFAULT_SETTINGS = {
     repoUrl: '',
@@ -36,6 +36,35 @@ const AUTO_GITIGNORE = [
 
 const NET_TIMEOUT_MS = 90000;
 const LOCAL_TIMEOUT_MS = 20000;
+
+// ---- 更改文件面板 ----
+const VIEW_TYPE_CHANGES = 'quick-github-sync-changes';
+const MAX_CHANGE_ROWS = 300;
+
+const debounce = (fn, ms) => {
+    let timer = null;
+    return (...args) => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => {
+            timer = null;
+            fn(...args);
+        }, ms);
+    };
+};
+
+// porcelain 的两个字符状态码 → 展示用的字母 + 中文说明 + 颜色类
+const describeStatus = (x, y) => {
+    const code = `${x}${y}`;
+    if (code === '??') return { letter: 'U', label: '未跟踪（新文件）', cls: 'qgs-st-new' };
+    if (x === 'U' || y === 'U' || code === 'AA' || code === 'DD')
+        return { letter: 'C', label: '有冲突', cls: 'qgs-st-conflict' };
+    if (x === 'R') return { letter: 'R', label: '重命名', cls: 'qgs-st-renamed' };
+    if (x === 'C') return { letter: 'C', label: '复制', cls: 'qgs-st-renamed' };
+    if (x === 'A') return { letter: 'A', label: '新增', cls: 'qgs-st-added' };
+    if (x === 'D' || y === 'D') return { letter: 'D', label: '已删除', cls: 'qgs-st-deleted' };
+    if (x === 'M' || y === 'M') return { letter: 'M', label: '已修改', cls: 'qgs-st-modified' };
+    return { letter: '?', label: code.trim() || '有改动', cls: 'qgs-st-modified' };
+};
 
 // ---- 提交记录文件 ----
 // 用一个 md 文档来写「这次提交了什么」：待填区手写，历史区由插件自动追加。
@@ -106,17 +135,23 @@ class QuickGitHubSyncPlugin extends Plugin {
         this.settingTab = new QuickGitHubSyncSettingTab(this.app, this);
         this.addSettingTab(this.settingTab);
 
+        this.registerView(VIEW_TYPE_CHANGES, (leaf) => new ChangesView(leaf, this));
+        this.registerChangesAutoRefresh();
+
         this.statusEl = this.addStatusBarItem();
         this.statusEl.addClass('quick-github-sync-status');
         this.statusEl.addEventListener('click', () => {
             // 未配置时点状态栏直接跳到设置页，而不是弹一句「请先配置」然后没下文
             if (!this.isConfigured()) this.openSettings();
             else if (this.status.state === 'need-note') this.openCommitNote();
+            // 有未提交改动时，点状态栏直接看改了哪些文件
+            else if (this.status.dirty > 0) this.openChangesView();
             else this.refreshStatus({ announce: true });
         });
         this.renderStatus();
 
         this.addRibbonIcon('cloud-upload', 'Sync vault with GitHub', () => this.sync());
+        this.addRibbonIcon('git-compare', '查看更改的文件', () => this.openChangesView());
 
         this.addCommand({
             id: 'sync',
@@ -137,6 +172,11 @@ class QuickGitHubSyncPlugin extends Plugin {
             id: 'open-commit-note',
             name: '打开提交记录（写这次提交了什么）',
             callback: () => this.openCommitNote(),
+        });
+        this.addCommand({
+            id: 'open-changes',
+            name: '查看更改的文件（VS Code 风格列表）',
+            callback: () => this.openChangesView(),
         });
 
         this.announceVersion();
@@ -331,7 +371,9 @@ class QuickGitHubSyncPlugin extends Plugin {
                         return;
                     }
                     if (errOut.trim()) logWarn('git 提示: ' + this.redact(errOut.trim()));
-                    resolve(out.trim());
+                    // raw：不要 trim。git status --porcelain 的第一条记录可能以空格开头
+                    // （" M 文件" 表示工作区改了但没 add），trim 会把路径整体错位一位。
+                    resolve(opts.raw ? out : out.trim());
                 }
             );
         });
@@ -357,7 +399,12 @@ class QuickGitHubSyncPlugin extends Plugin {
 
     async dirtyCount(vault) {
         try {
-            const out = await this.run(['-C', vault, 'status', '--porcelain'], { quiet: true });
+            // -uall：未跟踪的目录展开成具体文件来数，否则一个 themes/ 目录只算 1，
+            // 状态栏显示的数和「更改的文件」面板里的行数就会对不上
+            const out = await this.run(['-C', vault, 'status', '--porcelain', '-uall'], {
+                quiet: true,
+                raw: true,
+            });
             return out ? out.split('\n').filter((l) => l.trim()).length : 0;
         } catch (_) {
             return 0;
@@ -731,6 +778,229 @@ class QuickGitHubSyncPlugin extends Plugin {
         }
     }
 
+    // ---------- 更改的文件 ----------
+
+    // 解析 `git status --porcelain -z`。用 -z 是因为路径不会被加引号，
+    // 中文名、带空格的目录名（比如 .obsidian/themes/GitHub Theme/）都能原样拿到。
+    parseStatusEntries(raw) {
+        const parts = String(raw == null ? '' : raw).split('\0');
+        const out = [];
+
+        for (let i = 0; i < parts.length; i++) {
+            let rec = parts[i];
+            if (!rec) continue;
+
+            // 万一是被 trim 过的输出，第一条 " M x" 会变成 "M x"，补回那个空格
+            if (rec.length >= 3 && rec[2] !== ' ') rec = ' ' + rec;
+            if (rec.length < 4) continue;
+
+            const x = rec[0];
+            const y = rec[1];
+            const p = rec.slice(3);
+            let orig = null;
+
+            // 重命名/复制：原始路径紧跟在后面的一条记录里
+            if (x === 'R' || x === 'C') orig = parts[++i] || null;
+
+            out.push({ x, y, path: p, orig });
+        }
+        return out;
+    }
+
+    // 把 git 的 C 风格路径还原（"\346\217\220..." → 中文）。
+    // 平时会加 -c core.quotepath=false 避免走到这里，但多一层保险。
+    unquoteGitPath(p) {
+        if (!(p.length >= 2 && p.startsWith('"') && p.endsWith('"'))) return p;
+
+        const body = p.slice(1, -1);
+        const bytes = [];
+        const simple = { n: 10, t: 9, r: 13, '"': 34, '\\': 92, a: 7, b: 8, f: 12, v: 11 };
+
+        for (let i = 0; i < body.length; i++) {
+            const ch = body[i];
+            if (ch !== '\\') {
+                for (const b of Buffer.from(ch, 'utf8')) bytes.push(b);
+                continue;
+            }
+            const next = body[i + 1];
+            if (next >= '0' && next <= '7') {
+                bytes.push(parseInt(body.slice(i + 1, i + 4), 8));
+                i += 3;
+            } else {
+                bytes.push(simple[next] !== undefined ? simple[next] : next.charCodeAt(0));
+                i += 1;
+            }
+        }
+        return Buffer.from(bytes).toString('utf8');
+    }
+
+    parseNumstat(raw) {
+        const map = {};
+        for (const line of String(raw == null ? '' : raw).split('\n')) {
+            if (!line.trim()) continue;
+            const bits = line.split('\t');
+            if (bits.length < 3) continue;
+
+            const p = this.unquoteGitPath(bits.slice(2).join('\t'));
+            const stat = {
+                adds: bits[0] === '-' ? null : parseInt(bits[0], 10) || 0,
+                dels: bits[1] === '-' ? null : parseInt(bits[1], 10) || 0,
+            };
+            map[p] = stat;
+
+            // 重命名会被写成 "old => new" 或 "dir/{old => new}.md"，还原出新的路径
+            const brace = p.match(/^(.*)\{(.*) => (.*)\}(.*)$/);
+            if (brace) map[brace[1] + brace[3] + brace[4]] = stat;
+            else if (p.includes(' => ')) map[p.split(' => ').pop()] = stat;
+        }
+        return map;
+    }
+
+    async loadChanges() {
+        const vault = this.vaultPath();
+        // -uall 会把未跟踪的目录展开成一个个具体文件，而不是笼统一个 themes/
+        const raw = await this.run(
+            ['-C', vault, 'status', '--porcelain', '-z', '--untracked-files=all'],
+            { quiet: true, raw: true }
+        );
+        const entries = this.parseStatusEntries(raw);
+
+        let statMap = {};
+        try {
+            const num = await this.run(
+                ['-C', vault, '-c', 'core.quotepath=false', 'diff', 'HEAD', '--numstat'],
+                { quiet: true }
+            );
+            statMap = this.parseNumstat(num);
+        } catch (_) {
+            /* 还没有任何提交时 diff HEAD 会失败，忽略即可 */
+        }
+
+        return entries.map((e) => {
+            const info = describeStatus(e.x, e.y);
+            const n = statMap[e.path];
+            return {
+                path: e.path,
+                orig: e.orig,
+                letter: info.letter,
+                label: info.label,
+                cls: info.cls,
+                adds: n ? n.adds : null,
+                dels: n ? n.dels : null,
+            };
+        });
+    }
+
+    async openChangesView() {
+        const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE_CHANGES);
+        let leaf = leaves[0];
+
+        if (!leaf) {
+            leaf = this.app.workspace.getRightLeaf(false);
+            if (!leaf) {
+                new Notice('Quick GitHub Sync: 打不开侧边栏');
+                return;
+            }
+            await leaf.setViewState({ type: VIEW_TYPE_CHANGES, active: true });
+        }
+
+        try {
+            this.app.workspace.revealLeaf(leaf);
+        } catch (e) {
+            logWarn('revealLeaf 失败: ' + e.message);
+        }
+        if (leaf.view && typeof leaf.view.refresh === 'function') await leaf.view.refresh();
+    }
+
+    getChangesView() {
+        const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_CHANGES)[0];
+        return leaf && leaf.view ? leaf.view : null;
+    }
+
+    async openVaultFile(rel) {
+        try {
+            const f = this.app.vault.getAbstractFileByPath(rel);
+            if (f) {
+                await this.app.workspace.getLeaf(false).openFile(f);
+                return true;
+            }
+        } catch (e) {
+            logWarn('打开文件失败: ' + e.message);
+        }
+        try {
+            this.app.workspace.openLinkText(rel, '', false);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // 这些文件大多在 .obsidian/ 这种隐藏目录里，Obsidian 自己的文件列表看不到，
+    // 直接交给系统文件管理器定位最直观
+    revealInSystem(rel) {
+        try {
+            const { shell } = require('electron');
+            const abs = path.join(this.vaultPath(), rel);
+            if (!fs.existsSync(abs)) {
+                new Notice('Quick GitHub Sync: 文件不存在：' + rel);
+                return false;
+            }
+            shell.showItemInFolder(abs);
+            return true;
+        } catch (e) {
+            logWarn('在文件管理器中显示失败: ' + e.message);
+            new Notice('Quick GitHub Sync: 无法在文件管理器中显示\n' + e.message);
+            return false;
+        }
+    }
+
+    async showDiff(rel) {
+        const vault = this.vaultPath();
+        const abs = path.join(vault, rel);
+        let text = '';
+
+        try {
+            text = await this.run(['-C', vault, 'diff', 'HEAD', '--', rel], { quiet: true });
+        } catch (e) {
+            logWarn('取 diff 失败: ' + e.message);
+        }
+
+        // 未跟踪的文件不在 diff 里，退化成「整个文件都是新增行」
+        if (!text && fs.existsSync(abs)) {
+            try {
+                const st = fs.statSync(abs);
+                if (st.isDirectory()) {
+                    text = `（${rel} 是一个目录）`;
+                } else if (st.size > 2 * 1024 * 1024) {
+                    text = `（文件太大：${Math.round(st.size / 1024)} KB，不在这里展开）`;
+                } else {
+                    const lines = fs.readFileSync(abs, 'utf8').split('\n');
+                    const shown = lines.slice(0, 2000);
+                    text = [`--- /dev/null`, `+++ b/${rel}`, `@@ 未跟踪的新文件，共 ${lines.length} 行 @@`]
+                        .concat(shown.map((l) => '+' + l));
+                    if (lines.length > shown.length) text.push(`… 还有 ${lines.length - shown.length} 行未显示`);
+                    text = text.join('\n');
+                }
+            } catch (e) {
+                text = '读取文件失败：' + e.message;
+            }
+        }
+
+        if (!text) text = '（没有可显示的差异，可能只是文件权限或时间戳的变化）';
+        new DiffModal(this.app, rel, text).open();
+    }
+
+    // 文件一变就刷新面板（防抖，避免每敲一个字就跑一次 git）
+    registerChangesAutoRefresh() {
+        const touch = debounce(() => {
+            const view = this.getChangesView();
+            if (view) view.scheduleRefresh();
+        }, 700);
+        for (const evt of ['create', 'modify', 'delete', 'rename']) {
+            this.registerEvent(this.app.vault.on(evt, touch));
+        }
+    }
+
     // ---------- 状态 ----------
 
     setStatus(patch) {
@@ -796,7 +1066,7 @@ class QuickGitHubSyncPlugin extends Plugin {
             lines.push(`上次同步: ${s.lastSync ? stamp(s.lastSync) : '本次会话还没有'}`);
             if (s.checkedAt) lines.push(`状态检查: ${clock(s.checkedAt)}`);
             lines.push('');
-            lines.push('点击立即重新检查');
+            lines.push(s.dirty > 0 ? '点击查看改了哪些文件' : '点击立即重新检查');
             tip = lines.join('\n');
         }
 
@@ -1001,6 +1271,14 @@ class QuickGitHubSyncPlugin extends Plugin {
             const summary = pulled > 0 ? `同步完成（拉取 ${pulled} 个远端提交）` : '同步完成';
             new Notice('Quick GitHub Sync: ' + summary);
             logInfo('===== ' + summary + ' =====');
+
+            // 刷新更改面板只是附带动作，失败了也不该把同步报成失败
+            try {
+                const view = this.getChangesView();
+                if (view) await view.refresh();
+            } catch (e) {
+                logWarn('刷新更改面板失败: ' + e.message);
+            }
         } catch (e) {
             logError('同步失败: ' + e.message);
             this.setStatus({ state: 'error', message: e.message, checkedAt: new Date() });
@@ -1011,6 +1289,161 @@ class QuickGitHubSyncPlugin extends Plugin {
             this.busy = false;
             this.renderStatus();
         }
+    }
+}
+
+// 侧边栏面板：像 VS Code 的源代码管理那样列出改动过的文件
+class ChangesView extends ItemView {
+    constructor(leaf, plugin) {
+        super(leaf);
+        this.plugin = plugin;
+        this.files = [];
+        this.error = '';
+        this.loading = false;
+        this.scheduleRefresh = debounce(() => this.refresh(), 500);
+    }
+
+    getViewType() {
+        return VIEW_TYPE_CHANGES;
+    }
+
+    getDisplayText() {
+        return 'GitHub 更改';
+    }
+
+    getIcon() {
+        return 'git-compare';
+    }
+
+    async onOpen() {
+        this.contentEl.addClass('qgs-changes-view');
+        await this.refresh();
+    }
+
+    async refresh() {
+        if (this.loading) return;
+        this.loading = true;
+        try {
+            this.files = await this.plugin.loadChanges();
+            this.error = '';
+        } catch (e) {
+            this.error = e.message || String(e);
+            this.files = [];
+        }
+        this.loading = false;
+        this.render();
+    }
+
+    render() {
+        const el = this.contentEl;
+        el.empty();
+
+        const head = el.createDiv({ cls: 'qgs-cv-head' });
+        head.createDiv({ cls: 'qgs-cv-title', text: `更改的文件（${this.files.length}）` });
+        const refreshBtn = head.createEl('button', { cls: 'qgs-cv-refresh', text: '刷新' });
+        refreshBtn.addEventListener('click', () => this.refresh());
+
+        const s = this.plugin.status;
+        el.createDiv({
+            cls: 'qgs-cv-info',
+            text: `分支 ${this.plugin.branch()} · 远端新提交 ${s.behind} · 待推送 ${s.ahead}`,
+        });
+
+        if (this.error) {
+            el.createDiv({ cls: 'qgs-cv-error', text: '读取失败：' + this.error });
+            return;
+        }
+        if (!this.files.length) {
+            el.createDiv({ cls: 'qgs-cv-empty', text: '没有未提交的改动' });
+            return;
+        }
+
+        const list = el.createDiv({ cls: 'qgs-cv-list' });
+        for (const f of this.files.slice(0, MAX_CHANGE_ROWS)) {
+            const row = list.createDiv({ cls: 'qgs-cv-row' });
+            row.createSpan({ cls: `qgs-cv-badge ${f.cls}`, text: f.letter });
+
+            const nameWrap = row.createDiv({ cls: 'qgs-cv-path' });
+            const slash = f.path.lastIndexOf('/');
+            nameWrap.createSpan({ cls: 'qgs-cv-file', text: slash === -1 ? f.path : f.path.slice(slash + 1) });
+            if (slash !== -1) nameWrap.createSpan({ cls: 'qgs-cv-dir', text: ' ' + f.path.slice(0, slash + 1) });
+
+            if (f.adds !== null && f.adds !== undefined) {
+                row.createSpan({ cls: 'qgs-cv-stat-add', text: `+${f.adds}` });
+                row.createSpan({ cls: 'qgs-cv-stat-del', text: `-${f.dels}` });
+            }
+
+            row.title =
+                `${f.label}：${f.path}` +
+                (f.orig ? `\n（原路径：${f.orig}）` : '') +
+                '\n\n点击查看改动 · 右键更多操作';
+
+            row.addEventListener('click', () => this.plugin.showDiff(f.path));
+            row.addEventListener('contextmenu', (ev) => {
+                ev.preventDefault();
+                this.showRowMenu(ev, f);
+            });
+        }
+
+        if (this.files.length > MAX_CHANGE_ROWS) {
+            el.createDiv({
+                cls: 'qgs-cv-more',
+                text: `还有 ${this.files.length - MAX_CHANGE_ROWS} 个文件没有列出`,
+            });
+        }
+    }
+
+    showRowMenu(ev, f) {
+        const menu = new Menu();
+        menu.addItem((i) =>
+            i.setTitle('查看改动').setIcon('file-diff').onClick(() => this.plugin.showDiff(f.path))
+        );
+        menu.addItem((i) =>
+            i.setTitle('在 Obsidian 中打开').setIcon('file-text').onClick(() => this.plugin.openVaultFile(f.path))
+        );
+        menu.addItem((i) =>
+            i.setTitle('在访达 / 文件管理器中显示').setIcon('folder-open').onClick(() => this.plugin.revealInSystem(f.path))
+        );
+        menu.addItem((i) =>
+            i
+                .setTitle('复制文件路径')
+                .setIcon('copy')
+                .onClick(async () => {
+                    try {
+                        await navigator.clipboard.writeText(f.path);
+                        new Notice('已复制：' + f.path);
+                    } catch (e) {
+                        new Notice('复制失败：' + e.message);
+                    }
+                })
+        );
+        menu.showAtMouseEvent(ev);
+    }
+}
+
+class DiffModal extends Modal {
+    constructor(app, titleText, diffText) {
+        super(app);
+        this.titleText = titleText;
+        this.diffText = diffText;
+    }
+
+    onOpen() {
+        this.titleEl.setText(this.titleText);
+        const wrap = this.contentEl.createDiv({ cls: 'qgs-diff' });
+
+        for (const line of this.diffText.split('\n')) {
+            let cls = 'qgs-diff-line';
+            if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('diff ')) cls += ' qgs-diff-meta';
+            else if (line.startsWith('@@')) cls += ' qgs-diff-hunk';
+            else if (line.startsWith('+')) cls += ' qgs-diff-add';
+            else if (line.startsWith('-')) cls += ' qgs-diff-del';
+            wrap.createDiv({ cls, text: line || ' ' });
+        }
+    }
+
+    onClose() {
+        this.contentEl.empty();
     }
 }
 
@@ -1357,6 +1790,9 @@ class QuickGitHubSyncSettingTab extends PluginSettingTab {
                     await p.testConnection();
                     refreshStatusBox();
                 })
+            )
+            .addButton((b) =>
+                b.setButtonText('查看更改').onClick(() => p.openChangesView())
             )
             .addButton((b) =>
                 b.setButtonText('检查状态').onClick(async () => {

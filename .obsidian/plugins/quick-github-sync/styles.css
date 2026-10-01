@@ -37,3 +37,154 @@
 .quick-github-sync-settings .setting-item-description {
     line-height: 1.6;
 }
+
+/* ==================== 更改文件面板 ==================== */
+
+.qgs-changes-view {
+    padding: 0 4px 12px;
+}
+
+.qgs-cv-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 4px 0 6px;
+}
+
+.qgs-cv-title {
+    font-weight: 600;
+    font-size: var(--font-ui-small);
+}
+
+.qgs-cv-refresh {
+    font-size: var(--font-ui-smaller);
+    padding: 2px 8px;
+    height: auto;
+    cursor: pointer;
+}
+
+.qgs-cv-info {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+    margin-bottom: 10px;
+}
+
+.qgs-cv-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+
+.qgs-cv-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: var(--font-ui-smaller);
+    line-height: 1.5;
+}
+
+.qgs-cv-row:hover {
+    background-color: var(--background-modifier-hover);
+}
+
+.qgs-cv-badge {
+    flex: 0 0 auto;
+    width: 14px;
+    text-align: center;
+    font-weight: 700;
+    font-family: var(--font-monospace);
+}
+
+/* 状态颜色 */
+.qgs-st-modified {
+    color: var(--color-orange, #d9822b);
+}
+
+.qgs-st-new,
+.qgs-st-added {
+    color: var(--color-green, #08b94e);
+}
+
+.qgs-st-deleted,
+.qgs-st-conflict {
+    color: var(--color-red, #e93147);
+}
+
+.qgs-st-renamed {
+    color: var(--color-blue, #086ddd);
+}
+
+.qgs-cv-path {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.qgs-cv-dir {
+    color: var(--text-faint);
+}
+
+.qgs-cv-stat-add {
+    flex: 0 0 auto;
+    color: var(--color-green, #08b94e);
+    font-family: var(--font-monospace);
+}
+
+.qgs-cv-stat-del {
+    flex: 0 0 auto;
+    color: var(--color-red, #e93147);
+    font-family: var(--font-monospace);
+}
+
+.qgs-cv-empty,
+.qgs-cv-more {
+    color: var(--text-muted);
+    font-size: var(--font-ui-smaller);
+    padding: 8px 6px;
+}
+
+.qgs-cv-error {
+    color: var(--text-error);
+    font-size: var(--font-ui-smaller);
+    padding: 8px 6px;
+    white-space: pre-wrap;
+}
+
+/* ==================== 差异弹窗 ==================== */
+
+.qgs-diff {
+    font-family: var(--font-monospace);
+    font-size: var(--font-ui-smaller);
+    max-height: 70vh;
+    overflow: auto;
+    border: 1px solid var(--background-modifier-border);
+    border-radius: 6px;
+}
+
+.qgs-diff-line {
+    padding: 0 8px;
+    white-space: pre;
+}
+
+.qgs-diff-meta {
+    color: var(--text-muted);
+}
+
+.qgs-diff-hunk {
+    color: var(--color-blue, #086ddd);
+}
+
+.qgs-diff-add {
+    background-color: rgba(8, 185, 78, 0.12);
+}
+
+.qgs-diff-del {
+    background-color: rgba(233, 49, 71, 0.12);
+}
+
