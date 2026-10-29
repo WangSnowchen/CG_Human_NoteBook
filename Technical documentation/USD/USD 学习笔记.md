@@ -1,0 +1,3 @@
+> 以下是按照OpenUSD文档内的教程文档来学习的记录
+## hello world 创建usd
+这里提到了可以使用python api来创建usda文件，但是对于第一次接触只需要做了解即可，能够区分usd、usda、usdc这几个类型各自的用处就行。以及能够知道有一个usdview工具可以直接预览usd文件，并且对于usd、usdc这类文件可以通过usdcat展开成可读文件
